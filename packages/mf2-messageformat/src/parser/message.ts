@@ -8,21 +8,28 @@ import type {
   DeclarationParsed,
   LiteralParsed,
   MessageParsed,
-  NmtokenParsed,
   PatternParsed,
   PatternMessageParsed,
-  PlaceholderParsed,
+  ExpressionParsed,
   SelectMessageParsed,
   TextParsed,
   VariantParsed
 } from './data-model.js';
 import { parseDeclarations } from './declarations.js';
-import { parseNmtoken } from './names.js';
-import { parsePlaceholder } from './placeholder.js';
+import { parseExpression } from './expression.js';
 import { whitespaces } from './util.js';
 import { parseLiteral, parseText } from './values.js';
 
-export type ParseContext = {
+export class ParseContext {
+  readonly errors: MessageSyntaxError[] = [];
+  readonly resource: boolean;
+  readonly source: string;
+
+  constructor(source: string, opt?: { resource?: boolean }) {
+    this.resource = opt?.resource ?? false;
+    this.source = source;
+  }
+
   onError(
     type: Exclude<typeof MessageSyntaxError.prototype.type, 'missing-char'>,
     start: number,
@@ -33,40 +40,37 @@ export type ParseContext = {
     type: typeof MessageSyntaxError.prototype.type,
     start: number,
     end: number | string
-  ): void;
-  readonly errors: MessageSyntaxError[];
-  readonly source: string;
-};
+  ) {
+    let err: MessageSyntaxError;
+    switch (type) {
+      case 'key-mismatch':
+      case 'missing-fallback':
+        err = new MessageDataModelError(type, start, Number(end));
+        break;
+      case 'missing-char':
+        err = new MissingCharError(start, String(end));
+        break;
+      default:
+        err = new MessageSyntaxError(type, start, Number(end));
+    }
+    this.errors.push(err);
+  }
+}
 
-// Message ::= Declaration* ( Pattern | Selector Variant+ )
-// Selector ::= 'match' ( '{' Expression '}' )+
+// message = [s] *(declaration [s]) body [s]
+// body = pattern / (selectors 1*([s] variant))
+// selectors = match 1*([s] expression)
 /**
  * Parse the string syntax representation of a message into
  * its corresponding data model representation.
  *
  * @beta
  */
-export function parseMessage(source: string): MessageParsed {
-  const ctx: ParseContext = {
-    onError(type, start, end) {
-      let err: MessageSyntaxError;
-      switch (type) {
-        case 'key-mismatch':
-        case 'missing-fallback':
-          err = new MessageDataModelError(type, start, Number(end));
-          break;
-        case 'missing-char':
-          err = new MissingCharError(start, String(end));
-          break;
-        default:
-          err = new MessageSyntaxError(type, start, Number(end));
-      }
-      this.errors.push(err);
-    },
-    errors: [],
-    source
-  };
-
+export function parseMessage(
+  source: string,
+  opt?: { resource?: boolean }
+): MessageParsed {
+  const ctx = new ParseContext(source, opt);
   const { declarations, end: pos } = parseDeclarations(ctx);
 
   if (source.startsWith('match', pos)) {
@@ -103,11 +107,11 @@ function parseSelectMessage(
   let pos = start + 5; // 'match'
   pos += whitespaces(ctx.source, pos);
 
-  const selectors: PlaceholderParsed[] = [];
+  const selectors: ExpressionParsed[] = [];
   while (ctx.source[pos] === '{') {
-    const ph = parsePlaceholder(ctx, pos);
+    const ph = parseExpression(ctx, pos);
     switch (ph.body.type) {
-      case 'expression':
+      case 'function':
       case 'literal':
       case 'variable':
         break;
@@ -146,15 +150,15 @@ function parseSelectMessage(
   };
 }
 
-// Variant ::= 'when' ( WhiteSpace VariantKey )+ Pattern
-// VariantKey ::= Literal | Nmtoken | '*'
+// variant = when 1*(s key) [s] pattern
+// key = literal / "*"
 function parseVariant(
   ctx: ParseContext,
   start: number,
   selCount: number
 ): VariantParsed {
   let pos = start + 4; // 'when'
-  const keys: Array<LiteralParsed | NmtokenParsed | CatchallKeyParsed> = [];
+  const keys: Array<LiteralParsed | CatchallKeyParsed> = [];
   while (pos < ctx.source.length) {
     const ws = whitespaces(ctx.source, pos);
     pos += ws;
@@ -163,17 +167,10 @@ function parseVariant(
 
     if (ws === 0) ctx.onError('missing-char', pos, ' ');
 
-    let key: CatchallKeyParsed | LiteralParsed | NmtokenParsed;
-    switch (ch) {
-      case '*':
-        key = { type: '*', start: pos, end: pos + 1 };
-        break;
-      case '|':
-        key = parseLiteral(ctx, pos);
-        break;
-      default:
-        key = parseNmtoken(ctx, pos);
-    }
+    const key =
+      ch === '*'
+        ? ({ type: '*', start: pos, end: pos + 1 } satisfies CatchallKeyParsed)
+        : parseLiteral(ctx, pos, true);
     if (key.end === pos) break; // error; reported in pattern.errors
     keys.push(key);
     pos = key.end;
@@ -188,7 +185,7 @@ function parseVariant(
   return { start, end: value.end, keys, value };
 }
 
-// Pattern ::= '{' (Text | Placeholder)* '}' /* ws: explicit */
+// pattern = "{" *(text / expression) "}"
 function parsePattern(ctx: ParseContext, start: number): PatternParsed {
   if (ctx.source[start] !== '{') {
     ctx.onError('missing-char', start, '{');
@@ -196,11 +193,11 @@ function parsePattern(ctx: ParseContext, start: number): PatternParsed {
   }
 
   let pos = start + 1;
-  const body: Array<TextParsed | PlaceholderParsed> = [];
+  const body: Array<TextParsed | ExpressionParsed> = [];
   loop: while (pos < ctx.source.length) {
     switch (ctx.source[pos]) {
       case '{': {
-        const ph = parsePlaceholder(ctx, pos);
+        const ph = parseExpression(ctx, pos);
         body.push(ph);
         pos = ph.end;
         break;
